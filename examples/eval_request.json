@@ -1,0 +1,10 @@
+{
+  "version": "2026-09-17",
+  "flags": ["new_checkout", "dark_mode", "legacy_button"],
+  "user_id": "user-1",
+  "attributes": {
+    "email": "ada@acme.com",
+    "tier": "silver",
+    "theme": "auto"
+  }
+}

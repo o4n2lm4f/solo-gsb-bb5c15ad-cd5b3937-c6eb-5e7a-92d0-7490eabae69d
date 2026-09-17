@@ -1,0 +1,22 @@
+{
+  "version": "2026-09-18",
+  "flags": {
+    "signed_in": {
+      "enabled": true,
+      "default": false,
+      "rules": [
+        {
+          "id": "has-user",
+          "conditions": [{ "attr": "user_id", "op": "ne", "value": null }],
+          "value": true
+        }
+      ]
+    },
+    "new_checkout": {
+      "enabled": true,
+      "default": false,
+      "prerequisites": [{ "flag": "signed_in", "expect": true }],
+      "rollout": { "percentage": 100, "key": "user_id", "value": true }
+    }
+  }
+}

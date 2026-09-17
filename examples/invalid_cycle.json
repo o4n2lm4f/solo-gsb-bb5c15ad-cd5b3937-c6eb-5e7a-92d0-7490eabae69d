@@ -1,0 +1,7 @@
+{
+  "version": "bad-cycle",
+  "flags": {
+    "a": { "prerequisites": [{ "flag": "b" }] },
+    "b": { "prerequisites": [{ "flag": "a" }] }
+  }
+}

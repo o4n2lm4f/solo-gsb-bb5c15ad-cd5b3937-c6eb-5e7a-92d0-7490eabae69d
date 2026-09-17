@@ -1,0 +1,27 @@
+{
+  "version": "2026-09-19",
+  "flags": {
+    "signed_in": {
+      "enabled": true,
+      "default": false,
+      "rules": [
+        {
+          "id": "has-user",
+          "conditions": [{ "attr": "user_id", "op": "ne", "value": null }],
+          "value": true
+        },
+        {
+          "id": "staff-bypass",
+          "conditions": [{ "attr": "email", "op": "suffix", "value": "@acme.com" }],
+          "value": true
+        }
+      ]
+    },
+    "new_checkout": {
+      "enabled": true,
+      "default": false,
+      "prerequisites": [{ "flag": "signed_in", "expect": true }],
+      "rollout": { "percentage": 100, "key": "user_id", "value": true }
+    }
+  }
+}

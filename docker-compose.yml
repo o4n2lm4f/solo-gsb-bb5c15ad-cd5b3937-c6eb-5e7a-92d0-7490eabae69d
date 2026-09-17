@@ -1,0 +1,15 @@
+services:
+  flags:
+    build: .
+    image: feature-flag-service:latest
+    container_name: feature-flag-service
+    ports:
+      - "8000:8000"
+    environment:
+      FLAG_DB_PATH: /data/flags.db
+    volumes:
+      - flag-data:/data
+    restart: unless-stopped
+
+volumes:
+  flag-data:

@@ -1,0 +1,6 @@
+{
+  "version": "bad-percentage",
+  "flags": {
+    "f": { "rollout": { "percentage": 120, "key": "user_id" } }
+  }
+}

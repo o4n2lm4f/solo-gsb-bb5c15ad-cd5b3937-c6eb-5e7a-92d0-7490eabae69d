@@ -1,0 +1,55 @@
+{
+  "version": "2026-09-17",
+  "flags": {
+    "signed_in": {
+      "enabled": true,
+      "default": false,
+      "rules": [
+        {
+          "id": "has-user",
+          "conditions": [{ "attr": "user_id", "op": "ne", "value": null }],
+          "value": true
+        }
+      ]
+    },
+    "new_checkout": {
+      "enabled": true,
+      "default": false,
+      "prerequisites": [{ "flag": "signed_in", "expect": true }],
+      "rules": [
+        {
+          "id": "internal-testers",
+          "conditions": [{ "attr": "email", "op": "suffix", "value": "@acme.com" }],
+          "value": true
+        },
+        {
+          "id": "gold-tier",
+          "conditions": [{ "attr": "tier", "op": "in", "value": ["gold", "platinum"] }],
+          "value": true
+        }
+      ],
+      "rollout": { "percentage": 25, "key": "user_id", "value": true }
+    },
+    "dark_mode": {
+      "enabled": true,
+      "default": "system",
+      "rules": [
+        {
+          "id": "forced-light",
+          "conditions": [{ "attr": "theme", "op": "eq", "value": "light" }],
+          "value": "light"
+        },
+        {
+          "id": "forced-dark",
+          "conditions": [{ "attr": "theme", "op": "eq", "value": "dark" }],
+          "value": "dark"
+        }
+      ],
+      "rollout": { "percentage": 50, "key": "user_id", "value": "dark" }
+    },
+    "legacy_button": {
+      "enabled": false,
+      "default": false
+    }
+  }
+}
