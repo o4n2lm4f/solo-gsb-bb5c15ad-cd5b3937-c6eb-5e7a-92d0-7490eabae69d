@@ -20,8 +20,12 @@ from .schemas import (
     ConfigComparisonRequest,
     ConfigComparisonResponse,
     ConfigResponse,
+    EnvironmentEvalRequest,
+    EnvironmentEvalResponse,
+    EnvironmentResponse,
     PublishConfigRequest,
     PublishResponse,
+    PutEnvironmentRequest,
     VersionInfo,
 )
 from .validation import ConfigValidationError, validate_config
@@ -187,6 +191,38 @@ def compare_configs(body: ConfigComparisonRequest) -> Any:
 # ---------------------------------------------------------------------------
 
 
+def _evaluate_flags(
+    flags_cfg: dict[str, Any],
+    flag_names: list[str],
+    user_id: Any,
+    attributes: dict[str, Any],
+) -> tuple[dict[str, Any], list[dict[str, Any]], list[str]]:
+    """Evaluate a batch of flags against one immutable flag configuration."""
+    merged = dict(attributes)
+    if user_id is not None and "user_id" not in merged:
+        merged["user_id"] = user_id
+
+    results: list[dict[str, Any]] = []
+    missing: list[str] = []
+    for flag_name in flag_names:
+        try:
+            results.append(evaluate_flag(flag_name, flags_cfg, attributes=merged))
+        except FlagNotFound:
+            missing.append(flag_name)
+            results.append(
+                {
+                    "flag": flag_name,
+                    "value": False,
+                    "hit": False,
+                    "reason": "flag_not_found",
+                    "rule_id": None,
+                    "rollout": None,
+                    "chain": [],
+                }
+            )
+    return merged, results, missing
+
+
 @app.post("/api/v1/evaluate", response_model=BatchEvalResponse)
 def batch_evaluate(body: BatchEvalRequest) -> Any:
     conn = db_mod.connect()
@@ -203,35 +239,105 @@ def batch_evaluate(body: BatchEvalRequest) -> Any:
     finally:
         conn.close()
 
-    flags = row["config"]["flags"]
-    attributes = dict(body.attributes)
-    if body.user_id is not None and "user_id" not in attributes:
-        attributes["user_id"] = body.user_id
-
-    results: list[dict[str, Any]] = []
-    missing: list[str] = []
-    for flag_name in body.flags:
-        try:
-            results.append(
-                evaluate_flag(flag_name, flags, attributes=attributes)
-            )
-        except FlagNotFound:
-            missing.append(flag_name)
-            results.append(
-                {
-                    "flag": flag_name,
-                    "value": False,
-                    "hit": False,
-                    "reason": "flag_not_found",
-                    "rule_id": None,
-                    "rollout": None,
-                    "chain": [],
-                }
-            )
-
-    context = dict(attributes)
+    context, results, missing = _evaluate_flags(
+        row["config"]["flags"], body.flags, body.user_id, body.attributes
+    )
     return BatchEvalResponse(
         version=body.version, context=context, results=results, missing_flags=missing
+    )
+
+
+# ---------------------------------------------------------------------------
+# Environment pointers
+# ---------------------------------------------------------------------------
+
+
+@app.put("/api/v1/environments/{name}", response_model=EnvironmentResponse)
+def put_environment(name: str, body: PutEnvironmentRequest) -> Any:
+    conn = db_mod.connect()
+    try:
+        try:
+            snapshot = db_mod.set_environment(
+                conn, name, body.version, body.expected_revision
+            )
+        except db_mod.StaleRevisionError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "stale_revision",
+                    "message": str(exc),
+                },
+            )
+        except db_mod.VersionNotFoundError as exc:
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "code": "version_not_found",
+                    "message": str(exc),
+                },
+            )
+    finally:
+        conn.close()
+    return EnvironmentResponse(**snapshot)
+
+
+@app.get("/api/v1/environments/{name}", response_model=EnvironmentResponse)
+def get_environment(name: str) -> Any:
+    conn = db_mod.connect()
+    try:
+        row = db_mod.get_environment(conn, name)
+        if row is None:
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "code": "environment_not_found",
+                    "message": f"environment {name!r} not found",
+                },
+            )
+        return EnvironmentResponse(**row)
+    finally:
+        conn.close()
+
+
+@app.post(
+    "/api/v1/environments/{name}/evaluate", response_model=EnvironmentEvalResponse
+)
+def environment_evaluate(name: str, body: EnvironmentEvalRequest) -> Any:
+    conn = db_mod.connect()
+    try:
+        # Read the pointer exactly once: every flag in this request is
+        # evaluated against the same (version, revision) snapshot.
+        pointer = db_mod.get_environment(conn, name)
+        if pointer is None:
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "code": "environment_not_found",
+                    "message": f"environment {name!r} not found",
+                },
+            )
+        row = db_mod.get_version(conn, pointer["version"])
+        if row is None:
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "code": "version_not_found",
+                    "message": f"config version {pointer['version']!r} not found",
+                },
+            )
+    finally:
+        conn.close()
+
+    context, results, missing = _evaluate_flags(
+        row["config"]["flags"], body.flags, body.user_id, body.attributes
+    )
+    return EnvironmentEvalResponse(
+        name=pointer["name"],
+        version=pointer["version"],
+        revision=pointer["revision"],
+        context=context,
+        results=results,
+        missing_flags=missing,
     )
 
 
@@ -247,6 +353,9 @@ def root() -> dict[str, Any]:
             "GET /api/v1/configs/{version}",
             "POST /api/v1/config-comparisons",
             "POST /api/v1/evaluate",
+            "PUT /api/v1/environments/{name}",
+            "GET /api/v1/environments/{name}",
+            "POST /api/v1/environments/{name}/evaluate",
         ],
     }
 

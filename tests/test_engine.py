@@ -478,6 +478,86 @@ class ImmutableVersionStorageTests(unittest.TestCase):
         self.assertEqual(versions[0]["flag_count"], 1)
 
 
+class EnvironmentPointerTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        os.environ["FLAG_DB_PATH"] = os.path.join(self.tmp.name, "test.db")
+        self.conn = db_mod.connect()
+        db_mod.init_db(self.conn)
+        db_mod.insert_version(self.conn, "v1", {"flags": {"f": flag(default="v1")}})
+        db_mod.insert_version(self.conn, "v2", {"flags": {"f": flag(default="v2")}})
+
+    def tearDown(self):
+        self.conn.close()
+        self.tmp.cleanup()
+        os.environ.pop("FLAG_DB_PATH", None)
+
+    def test_create_requires_expected_revision_zero(self):
+        snap = db_mod.set_environment(self.conn, "prod", "v1", 0)
+        self.assertEqual(snap["revision"], 1)
+        self.assertEqual(snap["version"], "v1")
+        loaded = db_mod.get_environment(self.conn, "prod")
+        self.assertEqual((loaded["version"], loaded["revision"]), ("v1", 1))
+
+    def test_create_with_nonzero_revision_is_stale_and_leaves_no_pointer(self):
+        with self.assertRaises(db_mod.StaleRevisionError):
+            db_mod.set_environment(self.conn, "prod", "v1", 3)
+        self.assertIsNone(db_mod.get_environment(self.conn, "prod"))
+
+    def test_update_increments_revision(self):
+        db_mod.set_environment(self.conn, "prod", "v1", 0)
+        snap = db_mod.set_environment(self.conn, "prod", "v2", 1)
+        self.assertEqual((snap["version"], snap["revision"]), ("v2", 2))
+        loaded = db_mod.get_environment(self.conn, "prod")
+        self.assertEqual((loaded["version"], loaded["revision"]), ("v2", 2))
+
+    def test_stale_update_is_rejected_and_pointer_unchanged(self):
+        db_mod.set_environment(self.conn, "prod", "v1", 0)
+        db_mod.set_environment(self.conn, "prod", "v2", 1)
+        with self.assertRaises(db_mod.StaleRevisionError):
+            db_mod.set_environment(self.conn, "prod", "v1", 1)  # replayed write
+        loaded = db_mod.get_environment(self.conn, "prod")
+        self.assertEqual((loaded["version"], loaded["revision"]), ("v2", 2))
+
+    def test_unknown_version_is_rejected_and_pointer_unchanged(self):
+        db_mod.set_environment(self.conn, "prod", "v1", 0)
+        with self.assertRaises(db_mod.VersionNotFoundError):
+            db_mod.set_environment(self.conn, "prod", "ghost", 1)
+        loaded = db_mod.get_environment(self.conn, "prod")
+        self.assertEqual((loaded["version"], loaded["revision"]), ("v1", 1))
+        # Creating with an unknown version also fails before any insert.
+        with self.assertRaises(db_mod.VersionNotFoundError):
+            db_mod.set_environment(self.conn, "staging", "ghost", 0)
+        self.assertIsNone(db_mod.get_environment(self.conn, "staging"))
+
+    def test_concurrent_writers_exactly_one_wins(self):
+        import threading
+
+        db_mod.set_environment(self.conn, "prod", "v1", 0)
+        barrier = threading.Barrier(2)
+        outcomes = []
+
+        def writer(version):
+            conn = db_mod.connect()
+            try:
+                barrier.wait(timeout=10)
+                try:
+                    db_mod.set_environment(conn, "prod", version, 1)
+                    outcomes.append("ok")
+                except db_mod.StaleRevisionError:
+                    outcomes.append("stale")
+            finally:
+                conn.close()
+
+        threads = [threading.Thread(target=writer, args=(v,)) for v in ("v1", "v2")]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+        self.assertEqual(sorted(outcomes), ["ok", "stale"])
+        self.assertEqual(db_mod.get_environment(self.conn, "prod")["revision"], 2)
+
+
 class EndToEndPinnedVersionTests(unittest.TestCase):
     def test_pinned_version_result_is_stable(self):
         flags_v1 = {

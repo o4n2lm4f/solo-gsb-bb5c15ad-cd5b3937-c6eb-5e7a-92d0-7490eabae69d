@@ -9,6 +9,7 @@
 - 📋 **有序规则**：`rules` 按顺序匹配、首条命中即返回，支持 `eq/ne/in/nin/gt/ge/lt/le/prefix/suffix`。
 - 🎯 **稳定百分比分流**：`sha1(flag_key:user_id) % 100`，同一用户在同一开关上桶位恒定，放量单调扩大；不同开关独立分布。
 - 🔀 **版本影响分析**：对比任意两个已发布版本，给出开关级 `added/removed/modified` 差异，并沿两版本前置依赖边的并集反向传播，列出每个变化开关间接影响的上游开关及一条最短路径。
+- 🌍 **环境指针**：命名环境（如 `prod`）指向某个已发布版本，携带单调递增的 `revision`；写入需携带 `expected_revision` 乐观并发控制，判定接口按环境解析，单次请求使用同一指针快照。
 - 🚫 **发布时强校验**：循环依赖（含自依赖）、悬挂依赖、非法比例（非整数或越界）、未知操作符、重复规则 ID 一律拒绝。
 - 🧪 **纯函数引擎**：判定引擎与校验器零第三方依赖，可直接用系统 Python 跑单测。
 
@@ -164,6 +165,38 @@ curl -s -X POST http://localhost:8000/api/v1/config-comparisons \
 - 所有名称与路径均按字典序稳定排序，同一受影响开关只出现一次；没有受影响下游的变化开关也会列出（`impacted` 为空）；
 - 任一版本不存在返回 `404 version_not_found`。
 
+### 7. 环境指针（按环境发布与判定）
+
+环境指针把命名环境（如 `prod`）关联到某个**已发布版本**，并携带单调递增的 `revision` 做乐观并发控制。
+
+```bash
+# 创建指针：仅接受 expected_revision=0，创建后 revision=1
+curl -s -X PUT http://localhost:8000/api/v1/environments/prod \
+  -H 'Content-Type: application/json' --data @examples/env_put.json
+# → {"name":"prod","version":"2026-09-17","revision":1,"updated_at":"..."}
+
+# 读取当前指针
+curl -s http://localhost:8000/api/v1/environments/prod
+
+# 移动指针：必须带上当前 revision（基于上一步读到的 1）
+curl -s -X PUT http://localhost:8000/api/v1/environments/prod \
+  -H 'Content-Type: application/json' \
+  -d '{"version":"2026-09-18","expected_revision":1}'
+# → revision 变为 2
+
+# 按环境判定：无需传 version，响应回显本次使用的 version 与 revision
+curl -s -X POST http://localhost:8000/api/v1/environments/prod/evaluate \
+  -H 'Content-Type: application/json' --data @examples/env_eval_request.json
+```
+
+并发与一致性语义：
+
+- 创建仅接受 `expected_revision=0`（环境不存在视为 revision 0）；更新必须等于当前 revision，成功后 revision 加一；
+- revision 校验、目标版本存在性校验与指针移动在**同一个 `BEGIN IMMEDIATE` 事务**内完成：并发写入时只有一个成功，其余返回 `409 stale_revision`，且指针保持不变；
+- 指向不存在的版本返回 `404 version_not_found`，指针同样保持不变；
+- 环境不存在时，GET / evaluate 返回 `404 environment_not_found`；
+- 单次 `/evaluate` 请求只读取一次指针，请求内所有开关都使用同一 `(version, revision)` 快照，不会在请求中途切换到新版本。
+
 ### 非法配置会被拒绝
 
 ```bash
@@ -222,6 +255,7 @@ curl -s -X POST http://localhost:8000/api/v1/configs \
 ### 稳定性保证
 
 - 同一版本的配置以规范化 JSON 整体存入 SQLite（`config_versions` 表，主键即版本号），**只增不改**；
+- 环境指针存于 `environments` 表（主键为环境名），revision 校验与指针更新在同一 `BEGIN IMMEDIATE` 事务内完成，并发安全；
 - 判定是纯函数：`(配置, user_id, attributes) → 结果`，无随机数、无时间因子；
 - 哈希同时混入开关名（盐），不同开关互不相关；放量从 0→100 单调，不会反复抖动。
 
@@ -236,6 +270,9 @@ curl -s -X POST http://localhost:8000/api/v1/configs \
 | `GET` | `/api/v1/configs/{version}` | 获取某版本完整配置（不存在返回 404） |
 | `POST` | `/api/v1/config-comparisons` | 版本影响分析，请求体 `{from_version, to_version}`，返回开关差异与反向依赖影响（任一版本不存在返回 404） |
 | `POST` | `/api/v1/evaluate` | 批量判定，请求体 `{version, flags[], user_id?, attributes?}` |
+| `PUT` | `/api/v1/environments/{name}` | 创建/移动环境指针，请求体 `{version, expected_revision}`；创建仅接受 `expected_revision=0`；版本不存在返回 `404 version_not_found`，revision 过期返回 `409 stale_revision` 且指针不变 |
+| `GET` | `/api/v1/environments/{name}` | 读取环境指针当前 `version` 与 `revision`（不存在返回 `404 environment_not_found`） |
+| `POST` | `/api/v1/environments/{name}/evaluate` | 按环境指针判定，请求体 `{flags[], user_id?, attributes?}`；响应回显本次快照的 `version` 与 `revision` |
 | `GET` | `/healthz` | 健康检查 |
 
 错误统一使用信封格式：`{"error": {"code": "...", "message": "...", "errors": [...]}}`。
@@ -258,7 +295,7 @@ FLAG_DB_PATH=data/flags.db uvicorn app.main:app --reload --port 8000
 python3 -m unittest discover -s tests -v
 ```
 
-测试覆盖：有序规则与短路前置、依赖链顺序、禁用开关、哈希桶稳定性/单调性/边界（0 与 100）、二/三节点循环与自依赖拒绝、非法比例与未知操作符拒绝、SQLite 版本不可变与历史保留、固定版本重复判定稳定性、版本差异对比与影响传播（边并集、最短路径、字典序平局、并集成环、重复去重）。
+测试覆盖：有序规则与短路前置、依赖链顺序、禁用开关、哈希桶稳定性/单调性/边界（0 与 100）、二/三节点循环与自依赖拒绝、非法比例与未知操作符拒绝、SQLite 版本不可变与历史保留、固定版本重复判定稳定性、版本差异对比与影响传播（边并集、最短路径、字典序平局、并集成环、重复去重）、环境指针创建/更新/过期 revision 拒绝/未知版本拒绝/并发写入仅一方成功。
 
 ## 项目结构
 
@@ -266,11 +303,11 @@ python3 -m unittest discover -s tests -v
 app/
   main.py        FastAPI 路由与错误处理
   schemas.py     Pydantic v2 请求/响应模型
-  db.py          SQLite 不可变版本存储（WAL）
+  db.py          SQLite 存储（WAL）：不可变版本 + 环境指针
   validation.py  发布时语义校验（循环依赖/比例/操作符等）
   evaluator.py   纯函数判定引擎（前置、规则、稳定哈希分流）
   comparison.py  版本对比与反向依赖影响分析（纯函数）
 tests/           标准库 unittest 测试
-examples/        发布/判定/版本对比/非法配置示例
+examples/        发布/判定/版本对比/环境指针/非法配置示例
 Dockerfile, docker-compose.yml
 ```
