@@ -6,6 +6,7 @@ Run with:  python3 -m unittest discover -s tests -v
 import os
 import sys
 import tempfile
+import threading
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -492,6 +493,179 @@ class EndToEndPinnedVersionTests(unittest.TestCase):
             r2 = evaluate_flag("checkout", flags_v1, user_id=str(uid), attributes={"x": "y"})
             self.assertEqual(r1["hit"], r2["hit"])
             self.assertEqual([n["flag"] for n in r1["chain"]], ["signed_in", "checkout"])
+
+
+class EnvironmentPointerTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        os.environ["FLAG_DB_PATH"] = os.path.join(self.tmp.name, "test.db")
+        self.conn = db_mod.connect()
+        db_mod.init_db(self.conn)
+        self.config = {"flags": {"f": {"enabled": True, "default": "v1", "rules": []}}}
+        db_mod.insert_version(self.conn, "v1", self.config)
+        db_mod.insert_version(
+            self.conn, "v2", {"flags": {"f": {"enabled": True, "default": "v2", "rules": []}}}
+        )
+
+    def tearDown(self):
+        self.conn.close()
+        self.tmp.cleanup()
+        os.environ.pop("FLAG_DB_PATH", None)
+
+    def _upsert(self, name, version, expected_revision):
+        env, created = db_mod.upsert_environment(self.conn, name, version, expected_revision)
+        self.assertEqual(created, expected_revision == 0)
+        return env
+
+    def test_create_requires_revision_zero_and_starts_at_one(self):
+        env = self._upsert("prod", "v1", 0)
+        self.assertEqual(env["name"], "prod")
+        self.assertEqual(env["version"], "v1")
+        self.assertEqual(env["revision"], 1)
+        self.assertEqual(env["created_at"], env["updated_at"])
+
+        loaded = db_mod.get_environment(self.conn, "prod")
+        self.assertEqual(loaded["revision"], 1)
+        self.assertEqual(loaded["version"], "v1")
+
+    def test_create_then_update_increments_revision(self):
+        self._upsert("prod", "v1", 0)
+        env = self._upsert("prod", "v2", 1)
+        self.assertEqual(env["version"], "v2")
+        self.assertEqual(env["revision"], 2)
+        self.assertEqual(db_mod.get_environment(self.conn, "prod")["revision"], 2)
+
+    def test_create_with_nonzero_revision_on_missing_env_is_stale(self):
+        with self.assertRaises(db_mod.StaleRevision) as ctx:
+            db_mod.upsert_environment(self.conn, "prod", "v1", 1)
+        self.assertIsNone(ctx.exception.current)
+        self.assertIsNone(db_mod.get_environment(self.conn, "prod"))
+
+    def test_create_on_existing_env_with_revision_zero_is_stale_and_untouched(self):
+        db_mod.upsert_environment(self.conn, "prod", "v1", 0)
+        with self.assertRaises(db_mod.StaleRevision):
+            db_mod.upsert_environment(self.conn, "prod", "v2", 0)
+        # Pointer must not have moved.
+        self.assertEqual(db_mod.get_environment(self.conn, "prod")["version"], "v1")
+        self.assertEqual(db_mod.get_environment(self.conn, "prod")["revision"], 1)
+
+    def test_stale_update_does_not_move_pointer(self):
+        db_mod.upsert_environment(self.conn, "prod", "v1", 0)
+        db_mod.upsert_environment(self.conn, "prod", "v2", 1)  # revision now 2
+        with self.assertRaises(db_mod.StaleRevision) as ctx:
+            db_mod.upsert_environment(self.conn, "prod", "v1", 1)
+        self.assertEqual(ctx.exception.current, 2)
+        env = db_mod.get_environment(self.conn, "prod")
+        self.assertEqual(env["version"], "v2")
+        self.assertEqual(env["revision"], 2)
+
+    def test_missing_version_on_create_returns_not_found_without_row(self):
+        with self.assertRaises(db_mod.VersionNotFound):
+            db_mod.upsert_environment(self.conn, "prod", "ghost", 0)
+        self.assertIsNone(db_mod.get_environment(self.conn, "prod"))
+
+    def test_missing_version_on_update_returns_not_found_and_keeps_revision(self):
+        db_mod.upsert_environment(self.conn, "prod", "v1", 0)
+        with self.assertRaises(db_mod.VersionNotFound):
+            db_mod.upsert_environment(self.conn, "prod", "ghost", 1)
+        env = db_mod.get_environment(self.conn, "prod")
+        self.assertEqual(env["version"], "v1")
+        self.assertEqual(env["revision"], 1)
+
+    def test_stale_revision_takes_precedence_over_missing_version(self):
+        db_mod.upsert_environment(self.conn, "prod", "v1", 0)
+        # Both stale revision and unknown version: revision is checked first.
+        with self.assertRaises(db_mod.StaleRevision):
+            db_mod.upsert_environment(self.conn, "prod", "ghost", 99)
+        self.assertEqual(db_mod.get_environment(self.conn, "prod")["version"], "v1")
+
+    def test_get_missing_environment_returns_none(self):
+        self.assertIsNone(db_mod.get_environment(self.conn, "nope"))
+        self.assertIsNone(db_mod.get_environment_snapshot(self.conn, "nope"))
+
+    def test_snapshot_returns_pointer_and_pinned_config(self):
+        db_mod.upsert_environment(self.conn, "prod", "v1", 0)
+        snap = db_mod.get_environment_snapshot(self.conn, "prod")
+        self.assertEqual(snap["version"], "v1")
+        self.assertEqual(snap["revision"], 1)
+        self.assertEqual(snap["config"]["flags"]["f"]["default"], "v1")
+
+        # Moving the pointer changes the snapshot but never the old version.
+        db_mod.upsert_environment(self.conn, "prod", "v2", 1)
+        snap2 = db_mod.get_environment_snapshot(self.conn, "prod")
+        self.assertEqual(snap2["version"], "v2")
+        self.assertEqual(snap2["revision"], 2)
+        self.assertEqual(snap2["config"]["flags"]["f"]["default"], "v2")
+        # Snapshot captured earlier still describes v1.
+        self.assertEqual(snap["config"]["flags"]["f"]["default"], "v1")
+
+    def test_concurrent_updates_exactly_one_wins_per_revision(self):
+        """N racing writers all observe revision 1; exactly one must win."""
+        db_mod.upsert_environment(self.conn, "prod", "v1", 0)
+        n = 8
+        barrier = threading.Barrier(n)
+        outcomes: list[str] = []
+        outcomes_lock = threading.Lock()
+
+        def race() -> None:
+            conn = db_mod.connect()
+            try:
+                barrier.wait()
+                try:
+                    db_mod.upsert_environment(conn, "prod", "v2", 1)
+                    with outcomes_lock:
+                        outcomes.append("ok")
+                except db_mod.StaleRevision:
+                    with outcomes_lock:
+                        outcomes.append("stale")
+            finally:
+                conn.close()
+
+        threads = [threading.Thread(target=race) for _ in range(n)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        self.assertEqual(sorted(outcomes), ["ok"] + ["stale"] * (n - 1))
+        env = db_mod.get_environment(self.conn, "prod")
+        self.assertEqual(env["version"], "v2")
+        self.assertEqual(env["revision"], 2)
+
+    def test_concurrent_chain_no_lost_updates(self):
+        """Re-read-and-retry writers must produce exactly one increment each."""
+        db_mod.upsert_environment(self.conn, "prod", "v1", 0)
+
+        versions = ["v1", "v2"]
+        target_revisions = [2, 3]  # worker 0 ends at rev 2, worker 1 at rev 3
+
+        def worker(worker_id: int) -> None:
+            conn = db_mod.connect()
+            try:
+                while True:
+                    current = db_mod.get_environment(conn, "prod")
+                    try:
+                        db_mod.upsert_environment(
+                            conn,
+                            "prod",
+                            versions[worker_id],
+                            current["revision"],
+                        )
+                        return
+                    except db_mod.StaleRevision:
+                        continue
+            finally:
+                conn.close()
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        env = db_mod.get_environment(self.conn, "prod")
+        self.assertEqual(env["revision"], 3)
+        self.assertIn(env["version"], versions)
 
 
 if __name__ == "__main__":

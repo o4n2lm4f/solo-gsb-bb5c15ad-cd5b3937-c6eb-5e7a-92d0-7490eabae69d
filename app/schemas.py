@@ -152,3 +152,36 @@ class BatchEvalRequest(StrictModel):
     flags: list[str] = Field(min_length=1)
     user_id: Optional[Any] = None
     attributes: dict[str, Any] = Field(default_factory=dict)
+
+
+# ---------------------------------------------------------------------------
+# Environment pointer models
+# ---------------------------------------------------------------------------
+
+
+class EnvironmentUpsertRequest(StrictModel):
+    version: str = Field(min_length=1)
+    expected_revision: int = Field(ge=0)
+
+
+class EnvironmentResponse(BaseModel):
+    name: str
+    version: str
+    revision: int
+    created_at: str
+    updated_at: str
+
+
+class EnvironmentEvalRequest(StrictModel):
+    flags: list[str] = Field(min_length=1)
+    user_id: Optional[Any] = None
+    attributes: dict[str, Any] = Field(default_factory=dict)
+
+
+class EnvironmentEvalResponse(BaseModel):
+    name: str
+    version: str
+    revision: int
+    context: dict[str, Any]
+    results: list[EvalResult]
+    missing_flags: list[str]

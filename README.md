@@ -9,6 +9,7 @@
 - 📋 **有序规则**：`rules` 按顺序匹配、首条命中即返回，支持 `eq/ne/in/nin/gt/ge/lt/le/prefix/suffix`。
 - 🎯 **稳定百分比分流**：`sha1(flag_key:user_id) % 100`，同一用户在同一开关上桶位恒定，放量单调扩大；不同开关独立分布。
 - 🔀 **版本影响分析**：对比任意两个已发布版本，给出开关级 `added/removed/modified` 差异，并沿两版本前置依赖边的并集反向传播，列出每个变化开关间接影响的上游开关及一条最短路径。
+- 🌍 **环境指针 + 乐观并发**：`production`/`staging` 等环境是指向已发布版本的**指针**，带单调递增的 `revision`。创建只接受 `expected_revision=0`（初始 revision 为 1），更新须凭当前 revision 换号；同一 `BEGIN IMMEDIATE` 事务内完成校验、版本存在性确认与 revision 加一，竞争或过期写入得到 `409 stale_revision` 且指针不变。环境级判定单次请求使用同一指针快照，响应回显 `version` 与 `revision`。
 - 🚫 **发布时强校验**：循环依赖（含自依赖）、悬挂依赖、非法比例（非整数或越界）、未知操作符、重复规则 ID 一律拒绝。
 - 🧪 **纯函数引擎**：判定引擎与校验器零第三方依赖，可直接用系统 Python 跑单测。
 
@@ -164,6 +165,56 @@ curl -s -X POST http://localhost:8000/api/v1/config-comparisons \
 - 所有名称与路径均按字典序稳定排序，同一受影响开关只出现一次；没有受影响下游的变化开关也会列出（`impacted` 为空）；
 - 任一版本不存在返回 `404 version_not_found`。
 
+### 7. 环境指针：把环境绑定到已发布版本
+
+环境（如 `production`、`staging`）是一条指向**已发布不可变版本**的指针，记录在 SQLite 的 `environments` 表中（外键引用 `config_versions.version`），并带有一个单调递增的 `revision` 乐观锁：
+
+```bash
+# 新建环境：必须且只能带 expected_revision=0，创建成功后 revision=1，返回 201
+# （示例把 version 指向已发布的 v1；也可使用 examples/environment_put.json）
+curl -s -X PUT http://localhost:8000/api/v1/environments/production \
+  -H 'Content-Type: application/json' \
+  -d '{"version":"v1","expected_revision":0}'
+# {"name":"production","version":"v1","revision":1,"created_at":"...","updated_at":"..."}
+
+# 读取指针
+curl -s http://localhost:8000/api/v1/environments/production
+
+# 移动指针：凭上一次读到的 revision（当前为 1）更新，成功后 revision 加一，返回 200
+curl -s -X PUT http://localhost:8000/api/v1/environments/production \
+  -H 'Content-Type: application/json' \
+  -d '{"version":"v2","expected_revision":1}'
+```
+
+并发与错误语义（校验与写入在**同一个 `BEGIN IMMEDIATE` 事务**内完成）：
+
+- 新建时环境已存在（仍传 `expected_revision=0`），或更新时 `expected_revision` 与当前 revision 不一致（竞争失败 / 过期写入）→ `409 stale_revision`（更新失败时响应体带 `current_revision`），**指针与 revision 都不改动**；
+- 目标版本从未发布 → `404 version_not_found`，指针不改动（revision 也不自增）；同时满足“过期 + 版本不存在”时优先返回 `409`；
+- 新建一个不存在的环境却传非 0 revision → 同样返回 `409 stale_revision`；
+- 读取/判定一个不存在的环境 → `404 environment_not_found`。
+
+### 8. 面向环境的判定（自动跟随指针，单次请求同一快照）
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/environments/production/evaluate \
+  -H 'Content-Type: application/json' --data @examples/environment_eval.json
+```
+
+请求体只需要 `flags`、`user_id`、`attributes`，无需客户端知道版本号；服务端通过一条 JOIN 查询取出指针及其指向的版本，**整次请求固定在该快照上**（即使判定途中另一个请求移动了指针，本请求的全部开关仍来自同一版本）。响应回显指针的 `version` 与 `revision`：
+
+```json
+{
+  "name": "production",
+  "version": "v2",
+  "revision": 2,
+  "context": { "...": "..." },
+  "results": [ { "...与 /api/v1/evaluate 结构一致..." } ],
+  "missing_flags": []
+}
+```
+
+指针本身随时可被移动到新版本（或回滚到旧版本），但版本文档不可变，因此回显的 `(version, revision)` 与结果组合永远可复现；想绕过指针固定判定某个历史版本时，继续使用 `POST /api/v1/evaluate`。
+
 ### 非法配置会被拒绝
 
 ```bash
@@ -222,6 +273,7 @@ curl -s -X POST http://localhost:8000/api/v1/configs \
 ### 稳定性保证
 
 - 同一版本的配置以规范化 JSON 整体存入 SQLite（`config_versions` 表，主键即版本号），**只增不改**；
+- 环境指针存于 `environments` 表（`version` 外键指向 `config_versions`），指针可移动但版本文档永不变更；更新在单个 `BEGIN IMMEDIATE` 事务内完成“校验 revision → 确认版本存在 → revision+1 写入”，不会出现丢失更新或悬空指针；
 - 判定是纯函数：`(配置, user_id, attributes) → 结果`，无随机数、无时间因子；
 - 哈希同时混入开关名（盐），不同开关互不相关；放量从 0→100 单调，不会反复抖动。
 
@@ -235,7 +287,10 @@ curl -s -X POST http://localhost:8000/api/v1/configs \
 | `GET` | `/api/v1/configs` | 列出所有版本 |
 | `GET` | `/api/v1/configs/{version}` | 获取某版本完整配置（不存在返回 404） |
 | `POST` | `/api/v1/config-comparisons` | 版本影响分析，请求体 `{from_version, to_version}`，返回开关差异与反向依赖影响（任一版本不存在返回 404） |
-| `POST` | `/api/v1/evaluate` | 批量判定，请求体 `{version, flags[], user_id?, attributes?}` |
+| `PUT` | `/api/v1/environments/{name}` | 创建/移动环境指针，请求体 `{version, expected_revision}`；新建仅接受 `expected_revision=0`（201，revision 从 1 起），更新成功 revision 加一（200）；竞争/过期返回 409 `stale_revision`，版本不存在返回 404 `version_not_found` |
+| `GET` | `/api/v1/environments/{name}` | 读取环境指针，返回 `{name, version, revision, created_at, updated_at}`（环境不存在返回 404 `environment_not_found`） |
+| `POST` | `/api/v1/environments/{name}/evaluate` | 面向环境的批量判定，请求体 `{flags[], user_id?, attributes?}`，响应回显指针 `version`/`revision`，单次请求使用同一指针快照（环境不存在返回 404） |
+| `POST` | `/api/v1/evaluate` | 按显式版本批量判定，请求体 `{version, flags[], user_id?, attributes?}` |
 | `GET` | `/healthz` | 健康检查 |
 
 错误统一使用信封格式：`{"error": {"code": "...", "message": "...", "errors": [...]}}`。
@@ -258,7 +313,7 @@ FLAG_DB_PATH=data/flags.db uvicorn app.main:app --reload --port 8000
 python3 -m unittest discover -s tests -v
 ```
 
-测试覆盖：有序规则与短路前置、依赖链顺序、禁用开关、哈希桶稳定性/单调性/边界（0 与 100）、二/三节点循环与自依赖拒绝、非法比例与未知操作符拒绝、SQLite 版本不可变与历史保留、固定版本重复判定稳定性、版本差异对比与影响传播（边并集、最短路径、字典序平局、并集成环、重复去重）。
+测试覆盖：有序规则与短路前置、依赖链顺序、禁用开关、哈希桶稳定性/单调性/边界（0 与 100）、二/三节点循环与自依赖拒绝、非法比例与未知操作符拒绝、SQLite 版本不可变与历史保留、固定版本重复判定稳定性、版本差异对比与影响传播（边并集、最短路径、字典序平局、并集成环、重复去重）、环境指针的创建/更新/revision 自增/过期写入/版本不存在/409 优先于 404/指针快照一致性，以及多线程并发更新下“每个 revision 恰有一个胜者、无丢失更新”。
 
 ## 项目结构
 
@@ -266,11 +321,13 @@ python3 -m unittest discover -s tests -v
 app/
   main.py        FastAPI 路由与错误处理
   schemas.py     Pydantic v2 请求/响应模型
-  db.py          SQLite 不可变版本存储（WAL）
+  db.py          SQLite 不可变版本存储 + 环境指针（WAL、外键、BEGIN IMMEDIATE 乐观并发）
   validation.py  发布时语义校验（循环依赖/比例/操作符等）
   evaluator.py   纯函数判定引擎（前置、规则、稳定哈希分流）
   comparison.py  版本对比与反向依赖影响分析（纯函数）
 tests/           标准库 unittest 测试
-examples/        发布/判定/版本对比/非法配置示例
+examples/        发布/判定/版本对比/环境指针/非法配置示例
 Dockerfile, docker-compose.yml
 ```
+
+> 升级到包含环境指针的版本时，服务启动会自动对已有的 `flags.db` 执行 `CREATE TABLE IF NOT EXISTS environments`，卷中历史版本数据不受影响，无需手动迁移。
